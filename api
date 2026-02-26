@@ -1,1 +1,212 @@
+// ============================================================
+// Proxy Vercel — Anjun Tracking via Scraping
+// Arquivo: api/track.js
+// Deploy gratuito: https://vercel.com
+// ============================================================
+
+export default async function handler(req, res) {
+  // CORS para Shopify
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
+
+  const { code } = req.query;
+  if (!code || code.trim().length < 4) {
+    return res.status(400).json({ error: 'Código inválido.' });
+  }
+
+  const trackingCode = code.trim().toUpperCase();
+  const url = `https://anjunexpress.com/trackPackage?tracking=${trackingCode}`;
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+        'Referer': 'https://anjunexpress.com/',
+      }
+    });
+
+    if (!response.ok) {
+      return res.status(502).json({ error: `Anjun retornou status ${response.status}` });
+    }
+
+    const html = await response.text();
+
+    // O Nuxt injeta os dados no __NUXT_DATA__ como JSON no HTML
+    const data = extrairDadosNuxt(html, trackingCode);
+
+    if (!data) {
+      return res.status(404).json({ error: 'Nenhum dado encontrado para este código.' });
+    }
+
+    // Cache de 2 minutos
+    res.setHeader('Cache-Control', 's-maxage=120, stale-while-revalidate=60');
+    return res.status(200).json(data);
+
+  } catch (err) {
+    console.error('[Anjun Scraper]', err);
+    return res.status(500).json({ error: 'Erro ao buscar rastreamento.' });
+  }
+}
+
+function extrairDadosNuxt(html, trackingCode) {
+  try {
+    // Nuxt 3 injeta dados em <script id="__NUXT_DATA__" type="application/json">
+    const nuxtMatch = html.match(/<script[^>]*id="__NUXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+    if (nuxtMatch) {
+      const raw = JSON.parse(nuxtMatch[1]);
+      return parseNuxtPayload(raw, trackingCode);
+    }
+
+    // Fallback: procura window.__NUXT__
+    const windowMatch = html.match(/window\.__NUXT__\s*=\s*(\{[\s\S]*?\});?\s*<\/script>/i);
+    if (windowMatch) {
+      const raw = JSON.parse(windowMatch[1]);
+      return parseNuxtPayload(raw, trackingCode);
+    }
+
+    // Fallback 2: extrai do HTML diretamente
+    return extrairDoHTML(html, trackingCode);
+
+  } catch (e) {
+    console.error('[parse]', e.message);
+    // Tenta extrair do HTML mesmo se o JSON falhar
+    return extrairDoHTML(html, trackingCode);
+  }
+}
+
+function parseNuxtPayload(raw, trackingCode) {
+  // Nuxt 3 usa array de dados com referências
+  // Vamos procurar qualquer objeto que pareça eventos de rastreio
+  const jsonStr = JSON.stringify(raw);
+
+  // Procura por arrays de eventos de tracking
+  const eventPatterns = [
+    /"eventDate"|"trackDate"|"datetime"|"description"|"location"/gi,
+    /"date"|"desc"|"status"|"event"/gi
+  ];
+
+  // Tenta extrair eventos de rastreio do payload bruto
+  const eventos = [];
+
+  // Percorre o array do Nuxt procurando objetos com campos de rastreio
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (item && typeof item === 'object') {
+        const e = tentarExtrairEvento(item);
+        if (e) eventos.push(e);
+      }
+    }
+  }
+
+  // Procura recursivamente
+  if (eventos.length === 0) {
+    buscarEventosRecursivo(raw, eventos);
+  }
+
+  if (eventos.length > 0) {
+    return formatarResposta(trackingCode, eventos);
+  }
+
+  return null;
+}
+
+function tentarExtrairEvento(obj) {
+  const keys = Object.keys(obj).map(k => k.toLowerCase());
+
+  // Verifica se parece um evento de rastreio
+  const temData  = keys.some(k => ['date','datetime','time','data','hora'].includes(k));
+  const temDesc  = keys.some(k => ['desc','description','message','status','event','descricao'].includes(k));
+
+  if (temData && temDesc) {
+    return {
+      data:  obj.date || obj.datetime || obj.time || obj.data || obj.hora || '',
+      desc:  obj.desc || obj.description || obj.message || obj.status || obj.event || obj.descricao || '',
+      local: obj.location || obj.place || obj.city || obj.local || obj.cidade || ''
+    };
+  }
+  return null;
+}
+
+function buscarEventosRecursivo(obj, resultados, profundidade = 0) {
+  if (profundidade > 8 || !obj || typeof obj !== 'object') return;
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      if (item && typeof item === 'object') {
+        const e = tentarExtrairEvento(item);
+        if (e && e.desc) {
+          resultados.push(e);
+        } else {
+          buscarEventosRecursivo(item, resultados, profundidade + 1);
+        }
+      }
+    }
+  } else {
+    for (const val of Object.values(obj)) {
+      buscarEventosRecursivo(val, resultados, profundidade + 1);
+    }
+  }
+}
+
+function extrairDoHTML(html, trackingCode) {
+  const eventos = [];
+
+  // Padrões comuns que a Anjun usa no HTML renderizado
+  // Tenta extrair datas e descrições próximas
+  const blocos = html.split(/<tr|<li|<div class="[^"]*track/gi);
+
+  for (const bloco of blocos) {
+    const textoLimpo = bloco.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    if (textoLimpo.length < 10) continue;
+
+    // Procura por padrão data + descrição
+    const dataMatch = textoLimpo.match(/(\d{2}[\/\-]\d{2}[\/\-]\d{4}[\s,T]\d{2}:\d{2})/);
+    if (dataMatch && textoLimpo.length < 300) {
+      eventos.push({
+        data: dataMatch[1],
+        desc: textoLimpo.replace(dataMatch[1], '').trim().substring(0, 150),
+        local: ''
+      });
+    }
+  }
+
+  if (eventos.length > 0) {
+    return formatarResposta(trackingCode, eventos);
+  }
+
+  return null;
+}
+
+function formatarResposta(trackingCode, eventos) {
+  // Remove duplicatas e eventos vazios
+  const vistos = new Set();
+  const eventosFiltrados = eventos.filter(e => {
+    if (!e.desc || e.desc.length < 3) return false;
+    const chave = `${e.data}|${e.desc.substring(0, 30)}`;
+    if (vistos.has(chave)) return false;
+    vistos.add(chave);
+    return true;
+  });
+
+  if (eventosFiltrados.length === 0) return null;
+
+  // Determina status pelo último evento
+  const ultimo = eventosFiltrados[0];
+  const descLower = (ultimo.desc || '').toLowerCase();
+  let status = 'transit';
+  if (descLower.includes('entreg') || descLower.includes('deliver')) status = 'delivered';
+  else if (descLower.includes('saiu para entrega') || descLower.includes('out for delivery')) status = 'out';
+  else if (descLower.includes('tentativa') || descLower.includes('ausente')) status = 'failed';
+  else if (descLower.includes('retirada') || descLower.includes('pickup')) status = 'pickup';
+
+  return {
+    code: trackingCode,
+    status,
+    eventos: eventosFiltrados
+  };
+}
 
